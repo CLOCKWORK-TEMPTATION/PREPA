@@ -308,6 +308,7 @@ class Scene:
     location: Optional[str]
     time_of_day: Optional[str]
     int_ext: Optional[str]
+    time_period: str = "غير محدد"  # حقل جديد للفترة الزمنية (المتطلب 4)
     actions: list[str] = field(default_factory=list)
     dialogue: list[DialogueTurn] = field(default_factory=list)
     transitions: list[str] = field(default_factory=list)
@@ -316,6 +317,154 @@ class Scene:
     characters: list[str] = field(default_factory=list)
     embedding: Optional[list[float]] = None
     embedding_model: Optional[str] = None
+
+
+# ----------------------------
+# 2.5) وحدة استخراج الميتاداتا الزمنية (Temporal Metadata Extractor)
+# المتطلب 4: استخراج الميتاداتا الزمنية
+# ----------------------------
+class TemporalMetadataExtractor:
+    """
+    مسؤول عن استخراج الفترات الزمنية من عناوين المشاهد ومحتواها.
+    يبحث عن السنوات باستخدام نمط regex ويدعم وراثة الفترة الزمنية بين المشاهد.
+    """
+
+    # نمط regex للبحث عن السنوات (1900-2099)
+    YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
+
+    # مؤشرات زمنية إضافية في النص العربي
+    TEMPORAL_INDICATORS = [
+        "فلاش باك", "فلاشباك", "ذكريات", "الماضي",
+        "سنوات مضت", "عام", "سنة", "قبل"
+    ]
+
+    def __init__(self):
+        """تهيئة المستخرج مع قيمة افتراضية للسنة الأخيرة المعروفة"""
+        self.last_known_year: str = "غير محدد"
+        self.extraction_log: list[dict[str, Any]] = []
+
+    def extract_time_period(self, text: str, search_content: bool = True) -> str:
+        """
+        استخراج الفترة الزمنية من النص.
+
+        Args:
+            text: نص عنوان المشهد أو محتواه
+            search_content: البحث في محتوى المشهد وليس فقط العنوان
+
+        Returns:
+            السنة إن وُجدت، أو آخر سنة معروفة، أو "غير محدد"
+        """
+        try:
+            if not text:
+                return self.last_known_year
+
+            # البحث عن السنوات في النص
+            match = self.YEAR_PATTERN.search(text)
+            if match:
+                year = match.group(0)
+                self.last_known_year = year
+                self._log_extraction(text, year, "found")
+                return year
+
+            # إذا لم نجد سنة، نرث من المشهد السابق
+            return self.last_known_year
+
+        except Exception as e:
+            self._log_extraction(text, "غير محدد", f"error: {str(e)}")
+            return "غير محدد"
+
+    def extract_from_heading_and_content(self, heading: str, content: str) -> str:
+        """
+        استخراج الفترة الزمنية من عنوان المشهد ومحتواه.
+        يبحث أولاً في العنوان، ثم في المحتوى إذا لم يجد.
+
+        Args:
+            heading: عنوان المشهد
+            content: محتوى المشهد (الأحداث والحوارات)
+
+        Returns:
+            السنة المستخرجة أو القيمة الافتراضية
+        """
+        # البحث في العنوان أولاً
+        if heading:
+            match = self.YEAR_PATTERN.search(heading)
+            if match:
+                year = match.group(0)
+                self.last_known_year = year
+                self._log_extraction(heading, year, "found_in_heading")
+                return year
+
+        # البحث في المحتوى
+        if content:
+            match = self.YEAR_PATTERN.search(content)
+            if match:
+                year = match.group(0)
+                self.last_known_year = year
+                self._log_extraction(content[:100], year, "found_in_content")
+                return year
+
+        # وراثة من المشهد السابق
+        return self.last_known_year
+
+    def reset(self):
+        """إعادة تعيين حالة المستخرج"""
+        self.last_known_year = "غير محدد"
+        self.extraction_log = []
+
+    def apply_to_scenes(self, scenes: list["Scene"]) -> list["Scene"]:
+        """
+        تطبيق استخراج الفترة الزمنية على قائمة المشاهد.
+
+        Args:
+            scenes: قائمة المشاهد المراد معالجتها
+
+        Returns:
+            قائمة المشاهد مع حقل time_period محدث
+        """
+        self.reset()
+
+        for scene in scenes:
+            # تجميع محتوى المشهد للبحث فيه
+            content_parts = []
+            if scene.actions:
+                content_parts.extend(scene.actions)
+            if scene.dialogue:
+                for turn in scene.dialogue:
+                    content_parts.append(turn.text)
+
+            content = " ".join(content_parts)
+
+            # استخراج الفترة الزمنية
+            time_period = self.extract_from_heading_and_content(
+                scene.heading or "",
+                content
+            )
+
+            # تحديث المشهد
+            scene.time_period = time_period
+
+        return scenes
+
+    def _log_extraction(self, text: str, result: str, status: str):
+        """تسجيل عملية الاستخراج"""
+        self.extraction_log.append({
+            "text_preview": text[:50] if text else "",
+            "result": result,
+            "status": status
+        })
+
+    def get_extraction_stats(self) -> dict[str, Any]:
+        """الحصول على إحصائيات الاستخراج"""
+        found_count = sum(1 for log in self.extraction_log if "found" in log.get("status", ""))
+        error_count = sum(1 for log in self.extraction_log if "error" in log.get("status", ""))
+
+        return {
+            "total_extractions": len(self.extraction_log),
+            "found_years": found_count,
+            "errors": error_count,
+            "inherited": len(self.extraction_log) - found_count - error_count
+        }
+
 
 def elements_to_scenes(elements: list[dict[str, Any]]) -> list[Scene]:
     scenes: list[Scene] = []
@@ -1092,6 +1241,26 @@ def main():
         raise
 
     # ----------------------------
+    # استخراج الميتاداتا الزمنية (المتطلب 4)
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        logger.info("─" * 40)
+        logger.info("استخراج الميتاداتا الزمنية...")
+        stats.start_operation("استخراج الميتاداتا الزمنية")
+
+    temporal_extractor = TemporalMetadataExtractor()
+    scenes = temporal_extractor.apply_to_scenes(scenes)
+    temporal_stats = temporal_extractor.get_extraction_stats()
+
+    if ERROR_HANDLING_AVAILABLE:
+        stats.end_operation(
+            "استخراج الميتاداتا الزمنية",
+            items_processed=temporal_stats["found_years"],
+            details=temporal_stats
+        )
+        logger.success(f"✓ تم استخراج الفترات الزمنية: {temporal_stats['found_years']} وُجدت، {temporal_stats['inherited']} موروثة")
+
+    # ----------------------------
     # التضمينات الاختيارية
     # ----------------------------
     if args.use_api_embeddings:
@@ -1147,6 +1316,7 @@ def main():
                 "location": sc.location,
                 "time_of_day": sc.time_of_day,
                 "int_ext": sc.int_ext,
+                "time_period": sc.time_period,  # حقل الفترة الزمنية (المتطلب 4)
                 "characters": sc.characters,
                 "actions": sc.actions,
                 "transitions": sc.transitions,
@@ -1333,6 +1503,7 @@ def main():
     print(f"- أزواج الدور التالي: {len(pairs_rows)}")
     print(f"- التفاعلات: {len(interactions_rows)}")
     print(f"- أزواج تحديد المتحدث: {len(speaker_id_rows)}")
+    print(f"- الميتاداتا الزمنية: وُجدت={temporal_stats['found_years']}, موروثة={temporal_stats['inherited']}")
     print(f"مجلد الإخراج: {args.out_dir}")
 
     return 0
