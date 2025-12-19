@@ -69,3 +69,12 @@ next-env.d.ts
 *.bak
 *.tmp
 *.temp
+
+# Test artifacts
+.hypothesis/
+
+# Demo output
+demo_output/
+
+# Log files
+*.log
