@@ -57,6 +57,15 @@ except ImportError:
     genai_types = None
     print("WARNING: مكتبة google-genai غير مثبتة. pip install google-genai")
 
+# استيراد وحدة توحيد الكيانات
+try:
+    from entity_canonicalizer import EntityCanonicalizer, canonicalize_scenes, SIMILARITY_AVAILABLE
+    CANONICALIZER_AVAILABLE = True
+except ImportError:
+    CANONICALIZER_AVAILABLE = False
+    SIMILARITY_AVAILABLE = False
+    print("WARNING: وحدة entity_canonicalizer غير متوفرة")
+
 # Docling لمعالجة ملفات PDF
 try:
     from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -316,29 +325,115 @@ class ScreenplayParser:
 # 6. طبقة الإثراء الذكي (Enrichment Layer)
 # ---------------------------------------------------------
 class AIEnricher:
-    def __init__(self, use_gpu=True):
+    """
+    طبقة الإثراء الذكي للمشاهد والحوارات
+
+    تشمل:
+    - توحيد أسماء الشخصيات (Entity Canonicalization)
+    - توليد التضمينات (Embeddings)
+    - تحليل المشاعر (Sentiment Analysis)
+    """
+
+    def __init__(self, use_gpu=True, similarity_threshold: float = 0.85):
+        """
+        تهيئة طبقة الإثراء
+
+        Args:
+            use_gpu: استخدام GPU إذا كان متوفراً
+            similarity_threshold: عتبة التشابه لتوحيد الأسماء (افتراضي: 85%)
+        """
         self.embedder = None
         self.sentiment_analyzer = None
-        
+        self.canonicalizer = None
+        self.canonicalization_stats = {}
+
+        # تهيئة موحد الكيانات
+        if CANONICALIZER_AVAILABLE and SIMILARITY_AVAILABLE:
+            try:
+                self.canonicalizer = EntityCanonicalizer(similarity_threshold=similarity_threshold)
+                logger.info(f"تم تهيئة موحد الكيانات (عتبة التشابه: {similarity_threshold:.0%})")
+            except Exception as e:
+                logger.warning(f"فشل تهيئة موحد الكيانات: {e}")
+        else:
+            logger.warning("وحدة توحيد الكيانات غير متوفرة - تخطي توحيد الأسماء")
+
         if ML_AVAILABLE:
             try:
                 logger.info("تحميل نموذج Embeddings (E5-Small)...")
                 self.embedder = SentenceTransformer(Config.EMBEDDING_MODEL, device='cuda' if use_gpu else 'cpu')
-                
+
                 logger.info("تحميل نموذج تحليل المشاعر (CamelBERT)...")
                 self.sentiment_analyzer = hf_pipeline("text-classification", model=Config.SENTIMENT_MODEL, device=0 if use_gpu else -1)
             except Exception as e:
                 logger.warning(f"فشل تحميل النماذج: {e}")
 
-    def enrich(self, scenes: List[Scene]):
-        if not self.embedder: return
+    def canonicalize_entities(self, scenes: List[Scene], merge_log_path: Optional[Path] = None) -> List[Scene]:
+        """
+        توحيد أسماء الشخصيات في المشاهد
 
-        logger.info("بدء توليد التضمينات (Embeddings)...")
-        texts = [f"passage: {s.full_text[:2000]}" for s in scenes]
-        embeddings = self.embedder.encode(texts, show_progress_bar=True, batch_size=16)
-        for i, scene in enumerate(scenes):
-            scene.embedding = embeddings[i].tolist()
+        يقوم ببناء قاموس التطبيع وتطبيقه على جميع الحوارات
 
+        Args:
+            scenes: قائمة المشاهد
+            merge_log_path: مسار حفظ سجل الدمج (اختياري)
+
+        Returns:
+            المشاهد بعد توحيد الأسماء
+        """
+        if not self.canonicalizer:
+            logger.info("موحد الكيانات غير متوفر - تخطي توحيد الأسماء")
+            return scenes
+
+        logger.info("بدء توحيد أسماء الشخصيات...")
+
+        # بناء قاموس التطبيع
+        canonical_map = self.canonicalizer.build_canonical_map(scenes)
+
+        if canonical_map:
+            logger.info(f"تم العثور على {len(canonical_map)} اسم للتوحيد")
+
+            # تطبيق التوحيد
+            scenes = self.canonicalizer.apply_normalization(scenes)
+
+            # حفظ سجل الدمج
+            if merge_log_path:
+                self.canonicalizer.export_merge_log(merge_log_path)
+
+            # حفظ الإحصائيات
+            self.canonicalization_stats = self.canonicalizer.get_statistics()
+            logger.info(f"إحصائيات التوحيد: {self.canonicalization_stats}")
+        else:
+            logger.info("لا توجد أسماء متشابهة للتوحيد")
+
+        return scenes
+
+    def enrich(self, scenes: List[Scene], canonicalize: bool = True, merge_log_path: Optional[Path] = None) -> List[Scene]:
+        """
+        إثراء المشاهد بجميع التحسينات
+
+        يشمل: توحيد الأسماء، التضمينات، تحليل المشاعر
+
+        Args:
+            scenes: قائمة المشاهد
+            canonicalize: تطبيق توحيد الأسماء (افتراضي: True)
+            merge_log_path: مسار حفظ سجل دمج الأسماء
+
+        Returns:
+            المشاهد بعد الإثراء
+        """
+        # 1. توحيد أسماء الشخصيات (أولاً قبل أي معالجة أخرى)
+        if canonicalize:
+            scenes = self.canonicalize_entities(scenes, merge_log_path)
+
+        # 2. توليد التضمينات
+        if self.embedder:
+            logger.info("بدء توليد التضمينات (Embeddings)...")
+            texts = [f"passage: {s.full_text[:2000]}" for s in scenes]
+            embeddings = self.embedder.encode(texts, show_progress_bar=True, batch_size=16)
+            for i, scene in enumerate(scenes):
+                scene.embedding = embeddings[i].tolist()
+
+        # 3. تحليل المشاعر
         if self.sentiment_analyzer:
             logger.info("بدء تحليل مشاعر الحوارات...")
             for scene in scenes:
@@ -350,6 +445,17 @@ class AIEnricher:
                         turn.sentiment_score = res['score']
                     except:
                         pass
+
+        return scenes
+
+    def get_canonicalization_stats(self) -> dict:
+        """
+        الحصول على إحصائيات توحيد الأسماء
+
+        Returns:
+            قاموس الإحصائيات
+        """
+        return self.canonicalization_stats
 
     def build_social_graph(self, scenes: List[Scene]):
         """Build character interaction graph"""

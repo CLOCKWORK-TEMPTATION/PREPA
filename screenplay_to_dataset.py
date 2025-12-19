@@ -437,6 +437,28 @@ def extract_time_period(text: str, last_known: str = "غير محدد") -> Tuple
 
 
 # ----------------------------
+# استيراد وحدة معالجة الأخطاء والتسجيل (المتطلب 6)
+# ----------------------------
+try:
+    from error_handling import (
+        ArabicLogger,
+        ErrorHandler,
+        DataValidator,
+        SafeWriter,
+        StatisticsCollector,
+        LogLevel,
+        setup_error_handling,
+        safe_import,
+        get_logger,
+        set_logger,
+        ARABIC_ERROR_MESSAGES,
+    )
+    ERROR_HANDLING_AVAILABLE = True
+except ImportError:
+    ERROR_HANDLING_AVAILABLE = False
+    print("تحذير: وحدة معالجة الأخطاء غير متوفرة. سيتم استخدام الوضع الأساسي.")
+
+# ----------------------------
 # 1) Open-source Unstructured (local partition)
 # ----------------------------
 def local_partition(input_path: str) -> list[dict[str, Any]]:
@@ -714,6 +736,7 @@ class Scene:
     location: Optional[str]
     time_of_day: Optional[str]
     int_ext: Optional[str]
+    time_period: str = "غير محدد"  # حقل جديد للفترة الزمنية (المتطلب 4)
     time_period: str = "غير محدد"  # حقل جديد للفترة الزمنية
     actions: list[str] = field(default_factory=list)
     dialogue: list[DialogueTurn] = field(default_factory=list)
@@ -723,6 +746,154 @@ class Scene:
     characters: list[str] = field(default_factory=list)
     embedding: Optional[list[float]] = None
     embedding_model: Optional[str] = None
+
+
+# ----------------------------
+# 2.5) وحدة استخراج الميتاداتا الزمنية (Temporal Metadata Extractor)
+# المتطلب 4: استخراج الميتاداتا الزمنية
+# ----------------------------
+class TemporalMetadataExtractor:
+    """
+    مسؤول عن استخراج الفترات الزمنية من عناوين المشاهد ومحتواها.
+    يبحث عن السنوات باستخدام نمط regex ويدعم وراثة الفترة الزمنية بين المشاهد.
+    """
+
+    # نمط regex للبحث عن السنوات (1900-2099)
+    YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
+
+    # مؤشرات زمنية إضافية في النص العربي
+    TEMPORAL_INDICATORS = [
+        "فلاش باك", "فلاشباك", "ذكريات", "الماضي",
+        "سنوات مضت", "عام", "سنة", "قبل"
+    ]
+
+    def __init__(self):
+        """تهيئة المستخرج مع قيمة افتراضية للسنة الأخيرة المعروفة"""
+        self.last_known_year: str = "غير محدد"
+        self.extraction_log: list[dict[str, Any]] = []
+
+    def extract_time_period(self, text: str, search_content: bool = True) -> str:
+        """
+        استخراج الفترة الزمنية من النص.
+
+        Args:
+            text: نص عنوان المشهد أو محتواه
+            search_content: البحث في محتوى المشهد وليس فقط العنوان
+
+        Returns:
+            السنة إن وُجدت، أو آخر سنة معروفة، أو "غير محدد"
+        """
+        try:
+            if not text:
+                return self.last_known_year
+
+            # البحث عن السنوات في النص
+            match = self.YEAR_PATTERN.search(text)
+            if match:
+                year = match.group(0)
+                self.last_known_year = year
+                self._log_extraction(text, year, "found")
+                return year
+
+            # إذا لم نجد سنة، نرث من المشهد السابق
+            return self.last_known_year
+
+        except Exception as e:
+            self._log_extraction(text, "غير محدد", f"error: {str(e)}")
+            return "غير محدد"
+
+    def extract_from_heading_and_content(self, heading: str, content: str) -> str:
+        """
+        استخراج الفترة الزمنية من عنوان المشهد ومحتواه.
+        يبحث أولاً في العنوان، ثم في المحتوى إذا لم يجد.
+
+        Args:
+            heading: عنوان المشهد
+            content: محتوى المشهد (الأحداث والحوارات)
+
+        Returns:
+            السنة المستخرجة أو القيمة الافتراضية
+        """
+        # البحث في العنوان أولاً
+        if heading:
+            match = self.YEAR_PATTERN.search(heading)
+            if match:
+                year = match.group(0)
+                self.last_known_year = year
+                self._log_extraction(heading, year, "found_in_heading")
+                return year
+
+        # البحث في المحتوى
+        if content:
+            match = self.YEAR_PATTERN.search(content)
+            if match:
+                year = match.group(0)
+                self.last_known_year = year
+                self._log_extraction(content[:100], year, "found_in_content")
+                return year
+
+        # وراثة من المشهد السابق
+        return self.last_known_year
+
+    def reset(self):
+        """إعادة تعيين حالة المستخرج"""
+        self.last_known_year = "غير محدد"
+        self.extraction_log = []
+
+    def apply_to_scenes(self, scenes: list["Scene"]) -> list["Scene"]:
+        """
+        تطبيق استخراج الفترة الزمنية على قائمة المشاهد.
+
+        Args:
+            scenes: قائمة المشاهد المراد معالجتها
+
+        Returns:
+            قائمة المشاهد مع حقل time_period محدث
+        """
+        self.reset()
+
+        for scene in scenes:
+            # تجميع محتوى المشهد للبحث فيه
+            content_parts = []
+            if scene.actions:
+                content_parts.extend(scene.actions)
+            if scene.dialogue:
+                for turn in scene.dialogue:
+                    content_parts.append(turn.text)
+
+            content = " ".join(content_parts)
+
+            # استخراج الفترة الزمنية
+            time_period = self.extract_from_heading_and_content(
+                scene.heading or "",
+                content
+            )
+
+            # تحديث المشهد
+            scene.time_period = time_period
+
+        return scenes
+
+    def _log_extraction(self, text: str, result: str, status: str):
+        """تسجيل عملية الاستخراج"""
+        self.extraction_log.append({
+            "text_preview": text[:50] if text else "",
+            "result": result,
+            "status": status
+        })
+
+    def get_extraction_stats(self) -> dict[str, Any]:
+        """الحصول على إحصائيات الاستخراج"""
+        found_count = sum(1 for log in self.extraction_log if "found" in log.get("status", ""))
+        error_count = sum(1 for log in self.extraction_log if "error" in log.get("status", ""))
+
+        return {
+            "total_extractions": len(self.extraction_log),
+            "found_years": found_count,
+            "errors": error_count,
+            "inherited": len(self.extraction_log) - found_count - error_count
+        }
+
 
 def elements_to_scenes(elements: list[dict[str, Any]]) -> list[Scene]:
     scenes: list[Scene] = []
@@ -1533,6 +1704,99 @@ def main():
         logger.info("\n📄 المرحلة 1: استخراج العناصر من الملف...")
         stage_start = time.time()
 
+# 5) Main - مع تحسينات معالجة الأخطاء والتسجيل (المتطلب 6)
+# ----------------------------
+def main():
+    """
+    الدالة الرئيسية لنظام الراوي.
+
+    تنفذ المتطلبات التالية:
+    - المتطلب 6.1: تسجيل رسائل خطأ واضحة باللغة العربية
+    - المتطلب 6.2: تسجيل إحصائيات العمليات المنجزة
+    - المتطلب 6.4: التحقق من وجود البيانات المطلوبة قبل المعالجة
+    - المتطلب 6.5: التأكد من نجاح عملية الكتابة قبل المتابعة
+    """
+    import argparse
+    ap = argparse.ArgumentParser(description="نظام الراوي لمعالجة السيناريوهات العربية")
+    ap.add_argument("--input", required=True, help="مسار ملف السيناريو (txt/docx/pdf/...) أو قائمة elements.json")
+    ap.add_argument("--out_dir", required=True, help="مجلد الإخراج لملفات مجموعة البيانات")
+    ap.add_argument("--extractor", default="auto", choices=["auto", "unstructured", "docling"], help="محرك الاستخراج (auto: pdf->docling وإلا unstructured)")
+    ap.add_argument("--save_docling_artifacts", action="store_true", help="حفظ مخرجات docling الخام في مجلد الإخراج")
+    ap.add_argument("--docling_ocr_langs", default="ar,en", help="لغات OCR لـ docling (افتراضي: ar,en)")
+    ap.add_argument("--docling_threads", type=int, default=4, help="عدد خيوط docling (افتراضي: 4)")
+    ap.add_argument("--use_api_embeddings", action="store_true", help="استخدام API لإضافة التضمينات")
+    ap.add_argument("--api_work_dir", default="./_unstructured_work", help="مجلد العمل المؤقت لوظائف API")
+    ap.add_argument("--embedder_subtype", default="bedrock")
+    ap.add_argument("--embedder_model", default="cohere.embed-multilingual-v3")
+    ap.add_argument("--write_sqlite", action="store_true", help="كتابة قاعدة بيانات SQLite في مجلد الإخراج")
+    ap.add_argument("--log_file", default=None, help="مسار ملف السجل (اختياري)")
+    ap.add_argument("--verbose", action="store_true", help="تفعيل التسجيل التفصيلي")
+    args = ap.parse_args()
+
+    # ----------------------------
+    # تهيئة معالجة الأخطاء والتسجيل (المتطلب 6)
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        log_level = LogLevel.DEBUG if args.verbose else LogLevel.INFO
+        log_file = args.log_file or os.path.join(args.out_dir, "processing.log") if os.path.exists(args.out_dir) else args.log_file
+
+        logger, error_handler, validator, writer, stats = setup_error_handling(
+            log_file=log_file,
+            console_output=True,
+            log_level=log_level
+        )
+
+        logger.info("═" * 60)
+        logger.info("نظام الراوي الإصدار 4.0 - معالجة السيناريوهات العربية")
+        logger.info("═" * 60)
+        logger.info(f"ملف الإدخال: {args.input}")
+        logger.info(f"مجلد الإخراج: {args.out_dir}")
+
+        # بدء تتبع الإحصائيات
+        stats.start_operation("المعالجة الكاملة")
+
+        # ----------------------------
+        # التحقق من صحة المدخلات (المتطلب 6.4)
+        # ----------------------------
+        logger.info("─" * 40)
+        logger.info("التحقق من صحة المدخلات...")
+
+        # التحقق من وجود ملف الإدخال
+        input_validation = validator.validate_file_exists(args.input)
+        if not input_validation.is_valid:
+            for error in input_validation.errors:
+                logger.error(error)
+            error_handler.record_error(
+                error_type="ValidationError",
+                message="فشل التحقق من ملف الإدخال",
+                details=str(input_validation.errors)
+            )
+            stats.end_operation("المعالجة الكاملة", items_failed=1)
+            return 1
+
+        # التحقق من مجلد الإخراج
+        dir_validation = validator.validate_directory(args.out_dir, create_if_missing=True)
+        if not dir_validation.is_valid:
+            for error in dir_validation.errors:
+                logger.error(error)
+            return 1
+
+        logger.success("✓ تم التحقق من المدخلات بنجاح")
+
+    else:
+        # الوضع الأساسي بدون وحدة معالجة الأخطاء
+        os.makedirs(args.out_dir, exist_ok=True)
+        print(f"بدء المعالجة: {args.input}")
+
+    # ----------------------------
+    # استخراج العناصر
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        logger.info("─" * 40)
+        logger.info("استخراج العناصر من الملف...")
+        stats.start_operation("استخراج العناصر")
+
+    try:
         docling_langs = [x.strip() for x in (args.docling_ocr_langs or "").split(",") if x.strip()]
         elements, pipeline_meta = elements_from_input(
             input_path=args.input,
@@ -1685,6 +1949,127 @@ def main():
 
         for sc in scenes:
             scenes_rows.append({
+
+        if ERROR_HANDLING_AVAILABLE:
+            # التحقق من العناصر المستخرجة
+            elements_validation = validator.validate_elements(elements)
+            if not elements_validation.is_valid:
+                for error in elements_validation.errors:
+                    logger.error(error)
+                return 1
+
+            stats.end_operation("استخراج العناصر", items_processed=len(elements))
+            logger.success(f"✓ تم استخراج {len(elements)} عنصر")
+
+    except Exception as e:
+        if ERROR_HANDLING_AVAILABLE:
+            error_handler.handle_exception(e, "استخراج العناصر")
+            stats.end_operation("استخراج العناصر", items_failed=1)
+            logger.critical(f"فشل في استخراج العناصر: {str(e)}")
+        else:
+            print(f"خطأ: {str(e)}")
+        raise
+
+    # ----------------------------
+    # تحليل المشاهد
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        logger.info("─" * 40)
+        logger.info("تحليل المشاهد...")
+        stats.start_operation("تحليل المشاهد")
+
+    try:
+        scenes = elements_to_scenes(elements)
+
+        if ERROR_HANDLING_AVAILABLE:
+            scenes_validation = validator.validate_scenes(scenes)
+            if not scenes_validation.is_valid:
+                for error in scenes_validation.errors:
+                    logger.error(error)
+            for warning in scenes_validation.warnings:
+                logger.info(warning)
+
+            stats.end_operation("تحليل المشاهد", items_processed=len(scenes))
+            logger.success(f"✓ تم تحليل {len(scenes)} مشهد")
+
+    except Exception as e:
+        if ERROR_HANDLING_AVAILABLE:
+            error_handler.handle_exception(e, "تحليل المشاهد")
+            stats.end_operation("تحليل المشاهد", items_failed=1)
+        raise
+
+    # ----------------------------
+    # استخراج الميتاداتا الزمنية (المتطلب 4)
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        logger.info("─" * 40)
+        logger.info("استخراج الميتاداتا الزمنية...")
+        stats.start_operation("استخراج الميتاداتا الزمنية")
+
+    # تطبيق استخراج الميتاداتا الزمنية
+    temporal_extractor = TemporalMetadataExtractor()
+    scenes = temporal_extractor.apply_to_scenes(scenes)
+    temporal_stats = temporal_extractor.get_extraction_stats()
+
+    if ERROR_HANDLING_AVAILABLE:
+        stats.end_operation(
+            "استخراج الميتاداتا الزمنية",
+            items_processed=temporal_stats["found_years"],
+            details=temporal_stats
+        )
+        logger.success(f"✓ تم استخراج الفترات الزمنية: {temporal_stats['found_years']} وُجدت، {temporal_stats['inherited']} موروثة")
+
+    # ----------------------------
+    # التضمينات الاختيارية
+    # ----------------------------
+    # Optional: API embeddings
+    if args.use_api_embeddings:
+        if ERROR_HANDLING_AVAILABLE:
+            logger.info("─" * 40)
+            logger.info("إضافة التضمينات عبر API...")
+            stats.start_operation("إضافة التضمينات")
+
+        api_key = os.getenv("UNSTRUCTURED_API_KEY", "").strip()
+        if not api_key:
+            error_msg = "متغير البيئة UNSTRUCTURED_API_KEY غير معين"
+            if ERROR_HANDLING_AVAILABLE:
+                logger.error(error_msg)
+                error_handler.record_error("ConfigError", error_msg)
+            raise RuntimeError(error_msg)
+
+        try:
+            embed_scenes_via_on_demand_jobs(
+                scenes=scenes,
+                api_key=api_key,
+                work_dir=args.api_work_dir,
+                batch_size=10,
+                embedder_subtype=args.embedder_subtype,
+                embedder_model=args.embedder_model,
+            )
+            if ERROR_HANDLING_AVAILABLE:
+                stats.end_operation("إضافة التضمينات", items_processed=len(scenes))
+                logger.success("✓ تم إضافة التضمينات")
+
+        except Exception as e:
+            if ERROR_HANDLING_AVAILABLE:
+                # المتابعة عند فشل API (المتطلب 6.3)
+                error_handler.handle_exception(e, "إضافة التضمينات", continue_on_error=True)
+                stats.end_operation("إضافة التضمينات", items_failed=len(scenes))
+                logger.warning("تم المتابعة بدون التضمينات")
+
+    # ----------------------------
+    # تجهيز البيانات للتصدير
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        logger.info("─" * 40)
+        logger.info("تجهيز البيانات للتصدير...")
+        stats.start_operation("تجهيز البيانات")
+
+    scenes_rows: list[dict[str, Any]] = []
+    dialogue_rows: list[dict[str, Any]] = []
+    for sc in scenes:
+        scenes_rows.append(
+            {
                 "scene_id": sc.scene_id,
                 "scene_number": sc.scene_number,
                 "heading": sc.heading,
@@ -1692,6 +2077,8 @@ def main():
                 "time_of_day": sc.time_of_day,
                 "int_ext": sc.int_ext,
                 "time_period": sc.time_period,  # حقل جديد
+                "time_period": sc.time_period,  # حقل الفترة الزمنية (المتطلب 4)
+                "time_period": sc.time_period,  # حقل جديد للفترة الزمنية
                 "characters": sc.characters,
                 "actions": sc.actions,
                 "transitions": sc.transitions,
@@ -1849,6 +2236,181 @@ def main():
         except:
             pass
         raise
+    characters_rows = build_characters_index(scenes)
+    pairs_rows = make_next_turn_pairs(scenes)
+    interactions_rows = build_interactions_index(scenes)
+    speaker_id_rows = make_speaker_id_pairs(scenes)
+
+    if ERROR_HANDLING_AVAILABLE:
+        stats.end_operation("تجهيز البيانات", items_processed=len(scenes_rows) + len(dialogue_rows))
+        logger.success("✓ تم تجهيز البيانات")
+
+    # ----------------------------
+    # كتابة الملفات (المتطلب 6.5: ضمان نجاح الكتابة)
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        logger.info("─" * 40)
+        logger.info("كتابة ملفات الإخراج...")
+        stats.start_operation("كتابة الملفات")
+
+        files_to_write = [
+            ("scenes.jsonl", scenes_rows),
+            ("dialogue_turns.jsonl", dialogue_rows),
+            ("characters.jsonl", characters_rows),
+            ("next_turn_pairs.jsonl", pairs_rows),
+            ("character_interactions.jsonl", interactions_rows),
+            ("speaker_id_pairs.jsonl", speaker_id_rows),
+        ]
+
+        write_success_count = 0
+        write_fail_count = 0
+
+        for filename, rows in files_to_write:
+            path = os.path.join(args.out_dir, filename)
+            result = writer.write_jsonl(path, rows)
+            if result.success:
+                write_success_count += 1
+                logger.info(f"  ✓ {filename}: {len(rows)} سجل ({result.bytes_written} بايت)")
+            else:
+                write_fail_count += 1
+                logger.error(f"  ✗ فشل في كتابة {filename}: {result.error}")
+
+        # كتابة العناصر المحلية
+        elements_result = writer.write_json(
+            os.path.join(args.out_dir, "elements.local.json"),
+            elements,
+            indent=2
+        )
+        if elements_result.success:
+            write_success_count += 1
+            logger.info(f"  ✓ elements.local.json: {len(elements)} عنصر")
+        else:
+            write_fail_count += 1
+            logger.error(f"  ✗ فشل في كتابة elements.local.json")
+
+        stats.end_operation(
+            "كتابة الملفات",
+            items_processed=write_success_count,
+            items_failed=write_fail_count
+        )
+
+        # التحقق من نجاح جميع عمليات الكتابة (المتطلب 6.5)
+        if not writer.all_successful():
+            logger.warning("تحذير: بعض عمليات الكتابة فشلت")
+            failed_writes = writer.get_failed_writes()
+            for fw in failed_writes:
+                logger.error(f"  - {fw.path}: {fw.error}")
+
+    else:
+        # الوضع الأساسي
+        write_jsonl(os.path.join(args.out_dir, "scenes.jsonl"), scenes_rows)
+        write_jsonl(os.path.join(args.out_dir, "dialogue_turns.jsonl"), dialogue_rows)
+        write_jsonl(os.path.join(args.out_dir, "characters.jsonl"), characters_rows)
+        write_jsonl(os.path.join(args.out_dir, "next_turn_pairs.jsonl"), pairs_rows)
+        write_jsonl(os.path.join(args.out_dir, "character_interactions.jsonl"), interactions_rows)
+        write_jsonl(os.path.join(args.out_dir, "speaker_id_pairs.jsonl"), speaker_id_rows)
+
+        with open(os.path.join(args.out_dir, "elements.local.json"), "w", encoding="utf-8") as f:
+            json.dump(elements, f, ensure_ascii=False, indent=2)
+
+    # ----------------------------
+    # كتابة قاعدة بيانات SQLite
+    # ----------------------------
+    if args.write_sqlite:
+        if ERROR_HANDLING_AVAILABLE:
+            logger.info("─" * 40)
+            logger.info("كتابة قاعدة بيانات SQLite...")
+            stats.start_operation("كتابة SQLite")
+
+        try:
+            db_path = os.path.join(args.out_dir, "screenplay_dataset.sqlite")
+            write_sqlite_db(
+                db_path=db_path,
+                scenes_rows=scenes_rows,
+                dialogue_rows=dialogue_rows,
+                characters_rows=characters_rows,
+                interactions_rows=interactions_rows,
+                meta=pipeline_meta,
+            )
+
+            if ERROR_HANDLING_AVAILABLE:
+                stats.end_operation("كتابة SQLite", items_processed=1)
+                logger.success(f"✓ تم كتابة قاعدة البيانات: {db_path}")
+
+        except Exception as e:
+            if ERROR_HANDLING_AVAILABLE:
+                error_handler.handle_exception(e, "كتابة SQLite")
+                stats.end_operation("كتابة SQLite", items_failed=1)
+            raise
+
+    # ----------------------------
+    # إنهاء وطباعة الملخص (المتطلب 6.2: تسجيل الإحصائيات)
+    # ----------------------------
+    if ERROR_HANDLING_AVAILABLE:
+        stats.end_operation(
+            "المعالجة الكاملة",
+            items_processed=len(scenes),
+            details={
+                "scenes": len(scenes_rows),
+                "dialogue_turns": len(dialogue_rows),
+                "characters": len(characters_rows),
+                "next_turn_pairs": len(pairs_rows),
+                "interactions": len(interactions_rows),
+                "speaker_id_pairs": len(speaker_id_rows),
+            }
+        )
+
+        # إضافة إحصائيات عامة
+        stats.add_global_stat("إجمالي_المشاهد", len(scenes_rows))
+        stats.add_global_stat("إجمالي_الحوارات", len(dialogue_rows))
+        stats.add_global_stat("إجمالي_الشخصيات", len(characters_rows))
+        stats.add_global_stat("إجمالي_الكلمات", sum(r.get("word_count", 0) for r in dialogue_rows))
+
+        logger.info("═" * 60)
+        logger.info("ملخص المعالجة")
+        logger.info("═" * 60)
+        stats.print_summary()
+
+        # تصدير الإحصائيات
+        stats_path = os.path.join(args.out_dir, "processing_stats.json")
+        if stats.export_stats(stats_path):
+            logger.info(f"تم تصدير الإحصائيات: {stats_path}")
+
+        # تصدير سجلات الأخطاء إذا وجدت
+        if error_handler.has_critical_errors():
+            errors_path = os.path.join(args.out_dir, "errors.json")
+            with open(errors_path, 'w', encoding='utf-8') as f:
+                json.dump(error_handler.get_error_summary(), f, ensure_ascii=False, indent=2)
+            logger.warning(f"تم تصدير سجل الأخطاء: {errors_path}")
+
+        logger.info("═" * 60)
+        logger.info("✓ اكتملت المعالجة بنجاح")
+        logger.info("═" * 60)
+
+    else:
+        print("\n" + "=" * 50)
+        print("تم الانتهاء")
+        print("=" * 50)
+
+    print(f"- المشاهد: {len(scenes_rows)}")
+    print(f"- الحوارات: {len(dialogue_rows)}")
+    print(f"- الشخصيات: {len(characters_rows)}")
+    print(f"- أزواج الدور التالي: {len(pairs_rows)}")
+    print(f"- التفاعلات: {len(interactions_rows)}")
+    print(f"- أزواج تحديد المتحدث: {len(speaker_id_rows)}")
+    print(f"- الميتاداتا الزمنية: وُجدت={temporal_stats['found_years']}, موروثة={temporal_stats['inherited']}")
+    print(f"مجلد الإخراج: {args.out_dir}")
+
+    return 0
+    print("DONE")
+    print(f"- scenes: {len(scenes_rows)}")
+    print(f"- dialogue turns: {len(dialogue_rows)}")
+    print(f"- characters: {len(characters_rows)}")
+    print(f"- next-turn pairs: {len(pairs_rows)}")
+    print(f"- interactions: {len(interactions_rows)}")
+    print(f"- speaker-id pairs: {len(speaker_id_rows)}")
+    print(f"- temporal metadata: found={temporal_stats['found_years']}, inherited={temporal_stats['inherited']}")
+    print(f"Output dir: {args.out_dir}")
 
 if __name__ == "__main__":
     main()
