@@ -65,8 +65,21 @@ desktop.ini
 *.tsbuildinfo
 next-env.d.ts
 
+# ===== Testing =====
+.hypothesis/
+.pytest_cache/
+
 # ===== Misc =====
 *.bak
 *.tmp
 *.temp
 .hypothesis/
+
+# Test artifacts
+.hypothesis/
+
+# Demo output
+demo_output/
+
+# Log files
+*.log

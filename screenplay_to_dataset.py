@@ -309,6 +309,7 @@ class Scene:
     time_of_day: Optional[str]
     int_ext: Optional[str]
     time_period: str = "غير محدد"  # حقل جديد للفترة الزمنية (المتطلب 4)
+    time_period: str = "غير محدد"  # حقل جديد للفترة الزمنية
     actions: list[str] = field(default_factory=list)
     dialogue: list[DialogueTurn] = field(default_factory=list)
     transitions: list[str] = field(default_factory=list)
@@ -1248,6 +1249,7 @@ def main():
         logger.info("استخراج الميتاداتا الزمنية...")
         stats.start_operation("استخراج الميتاداتا الزمنية")
 
+    # تطبيق استخراج الميتاداتا الزمنية
     temporal_extractor = TemporalMetadataExtractor()
     scenes = temporal_extractor.apply_to_scenes(scenes)
     temporal_stats = temporal_extractor.get_extraction_stats()
@@ -1263,6 +1265,7 @@ def main():
     # ----------------------------
     # التضمينات الاختيارية
     # ----------------------------
+    # Optional: API embeddings
     if args.use_api_embeddings:
         if ERROR_HANDLING_AVAILABLE:
             logger.info("─" * 40)
@@ -1317,6 +1320,7 @@ def main():
                 "time_of_day": sc.time_of_day,
                 "int_ext": sc.int_ext,
                 "time_period": sc.time_period,  # حقل الفترة الزمنية (المتطلب 4)
+                "time_period": sc.time_period,  # حقل جديد للفترة الزمنية
                 "characters": sc.characters,
                 "actions": sc.actions,
                 "transitions": sc.transitions,
@@ -1507,6 +1511,15 @@ def main():
     print(f"مجلد الإخراج: {args.out_dir}")
 
     return 0
+    print("DONE")
+    print(f"- scenes: {len(scenes_rows)}")
+    print(f"- dialogue turns: {len(dialogue_rows)}")
+    print(f"- characters: {len(characters_rows)}")
+    print(f"- next-turn pairs: {len(pairs_rows)}")
+    print(f"- interactions: {len(interactions_rows)}")
+    print(f"- speaker-id pairs: {len(speaker_id_rows)}")
+    print(f"- temporal metadata: found={temporal_stats['found_years']}, inherited={temporal_stats['inherited']}")
+    print(f"Output dir: {args.out_dir}")
 
 if __name__ == "__main__":
     main()
