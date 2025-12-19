@@ -5,8 +5,436 @@ import math
 import mimetypes
 import hashlib
 import sqlite3
+import logging
 from dataclasses import dataclass, field, asdict
-from typing import Any, Optional
+from typing import Any, Optional, Dict, List, Tuple
+from pathlib import Path
+
+# ----------------------------
+# إعداد نظام التسجيل (Logging)
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
+logger = logging.getLogger(__name__)
+
+# ----------------------------
+# الاستيراد الآمن للمكتبات الجديدة
+# ----------------------------
+RAPIDFUZZ_AVAILABLE = False
+DIFFLIB_AVAILABLE = False
+
+try:
+    from rapidfuzz import fuzz
+    RAPIDFUZZ_AVAILABLE = True
+    logger.info("✓ مكتبة rapidfuzz متوفرة")
+except ImportError:
+    logger.warning("⚠ مكتبة rapidfuzz غير متوفرة، سيتم استخدام difflib")
+    try:
+        import difflib
+        DIFFLIB_AVAILABLE = True
+        logger.info("✓ مكتبة difflib متوفرة كبديل")
+    except ImportError:
+        logger.error("✗ لا توجد مكتبات حساب التشابه - سيتم تخطي توحيد الكيانات")
+
+# hypothesis للاختبارات (اختياري)
+HYPOTHESIS_AVAILABLE = False
+try:
+    from hypothesis import given, strategies as st
+    HYPOTHESIS_AVAILABLE = True
+except ImportError:
+    pass
+
+# ----------------------------
+# نمط regex لاستخراج السنوات (الميتاداتا الزمنية)
+# ----------------------------
+YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
+
+# ----------------------------
+# دالة مساعدة لعد الكلمات العربية
+# ----------------------------
+def count_arabic_words(text: str) -> int:
+    """عد الكلمات في النص العربي"""
+    if not text:
+        return 0
+    words = text.split()
+    return len([w for w in words if w.strip()])
+
+# ----------------------------
+# دالة حساب التشابه بين النصوص
+# ----------------------------
+def calculate_similarity(name1: str, name2: str) -> float:
+    """
+    حساب نسبة التشابه بين اسمين باستخدام rapidfuzz أو difflib
+
+    Returns:
+        نسبة التشابه (0.0 - 1.0)
+    """
+    if not name1 or not name2:
+        return 0.0
+
+    if RAPIDFUZZ_AVAILABLE:
+        from rapidfuzz import fuzz
+        return fuzz.ratio(name1, name2) / 100.0
+    elif DIFFLIB_AVAILABLE:
+        import difflib
+        return difflib.SequenceMatcher(None, name1, name2).ratio()
+    else:
+        return 0.0
+
+# ----------------------------
+# فئة توحيد الكيانات (EntityCanonicalizer)
+# ----------------------------
+class EntityCanonicalizer:
+    """
+    مسؤول عن توحيد أسماء الشخصيات المتشابهة
+    يستخدم خوارزمية المسافة الليفنشتاين لحساب التشابه
+    """
+
+    def __init__(self, similarity_threshold: float = 0.85):
+        """
+        Args:
+            similarity_threshold: نسبة التشابه المطلوبة للدمج (افتراضي: 85%)
+        """
+        self.threshold = similarity_threshold
+        self.canonical_map: Dict[str, str] = {}
+        self.merge_log: List[Dict[str, Any]] = []
+        self.stats = {
+            "total_names": 0,
+            "unique_names_before": 0,
+            "unique_names_after": 0,
+            "merges_performed": 0
+        }
+
+    def _count_occurrences(self, scenes: List['Scene']) -> Dict[str, int]:
+        """عد تكرارات كل اسم شخصية"""
+        counts: Dict[str, int] = {}
+        for scene in scenes:
+            for turn in scene.dialogue:
+                speaker = turn.speaker.strip()
+                if speaker:
+                    counts[speaker] = counts.get(speaker, 0) + 1
+        return counts
+
+    def build_canonical_map(self, scenes: List['Scene']) -> Dict[str, str]:
+        """
+        بناء قاموس التطبيع من جميع المشاهد
+
+        Returns:
+            قاموس يربط الأسماء المتشابهة بالاسم الكانوني
+        """
+        if not (RAPIDFUZZ_AVAILABLE or DIFFLIB_AVAILABLE):
+            logger.warning("لا تتوفر مكتبات حساب التشابه - تخطي توحيد الكيانات")
+            return {}
+
+        occurrences = self._count_occurrences(scenes)
+        names = list(occurrences.keys())
+
+        self.stats["total_names"] = sum(occurrences.values())
+        self.stats["unique_names_before"] = len(names)
+
+        if len(names) < 2:
+            self.stats["unique_names_after"] = len(names)
+            return {}
+
+        # مجموعات الأسماء المتشابهة
+        processed = set()
+        groups: List[List[str]] = []
+
+        for i, name1 in enumerate(names):
+            if name1 in processed:
+                continue
+
+            group = [name1]
+            processed.add(name1)
+
+            for j, name2 in enumerate(names[i+1:], i+1):
+                if name2 in processed:
+                    continue
+
+                similarity = calculate_similarity(name1, name2)
+                if similarity >= self.threshold:
+                    group.append(name2)
+                    processed.add(name2)
+
+            if len(group) > 1:
+                groups.append(group)
+
+        # بناء قاموس التطبيع
+        for group in groups:
+            # اختيار الاسم الكانوني: الأكثر تكراراً، ثم الأطول
+            canonical = max(group, key=lambda x: (occurrences.get(x, 0), len(x)))
+
+            for name in group:
+                if name != canonical:
+                    self.canonical_map[name] = canonical
+                    self.merge_log.append({
+                        "original": name,
+                        "canonical": canonical,
+                        "similarity": calculate_similarity(name, canonical),
+                        "original_count": occurrences.get(name, 0),
+                        "canonical_count": occurrences.get(canonical, 0)
+                    })
+                    self.stats["merges_performed"] += 1
+
+        self.stats["unique_names_after"] = self.stats["unique_names_before"] - self.stats["merges_performed"]
+
+        logger.info(f"✓ توحيد الكيانات: {self.stats['merges_performed']} عملية دمج")
+        return self.canonical_map
+
+    def normalize_character_name(self, name: str) -> str:
+        """
+        تطبيع اسم شخصية واحدة
+
+        Returns:
+            الاسم الكانوني
+        """
+        return self.canonical_map.get(name.strip(), name.strip())
+
+    def apply_normalization(self, scenes: List['Scene']) -> List['Scene']:
+        """
+        تطبيق التطبيع على جميع الحوارات في المشاهد
+        """
+        if not self.canonical_map:
+            return scenes
+
+        for scene in scenes:
+            for turn in scene.dialogue:
+                original = turn.speaker
+                turn.speaker = self.normalize_character_name(original)
+
+            # تحديث قائمة الشخصيات
+            scene.characters = list(set(
+                self.normalize_character_name(c) for c in scene.characters
+            ))
+
+        return scenes
+
+    def export_merge_log(self, output_path: str):
+        """حفظ سجل عمليات الدمج"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "stats": self.stats,
+                    "merge_log": self.merge_log,
+                    "canonical_map": self.canonical_map
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"✓ تم حفظ سجل الدمج في: {output_path}")
+        except Exception as e:
+            logger.error(f"✗ فشل حفظ سجل الدمج: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """الحصول على إحصائيات التوحيد"""
+        return self.stats.copy()
+
+
+# ----------------------------
+# فئة فلترة الجودة (QualityFilter)
+# ----------------------------
+class QualityFilter:
+    """
+    فلترة الحوارات منخفضة الجودة
+    """
+
+    def __init__(self, min_words: int = 3, high_sentiment_threshold: float = 0.8):
+        """
+        Args:
+            min_words: الحد الأدنى لعدد الكلمات (افتراضي: 3)
+            high_sentiment_threshold: عتبة المشاعر العالية (افتراضي: 0.8)
+        """
+        self.min_words = min_words
+        self.sentiment_threshold = high_sentiment_threshold
+        self.filtered_count = 0
+        self.kept_count = 0
+        self.kept_by_sentiment = 0
+        self.filter_log: List[Dict[str, Any]] = []
+
+    def should_keep_turn(self, turn: 'DialogueTurn') -> bool:
+        """
+        تحديد ما إذا كان يجب الاحتفاظ بالحوار
+
+        Returns:
+            True إذا كان الحوار عالي الجودة
+        """
+        word_count = count_arabic_words(turn.text)
+
+        # قاعدة 1: الحوارات الطويلة تُحفظ دائماً
+        if word_count >= self.min_words:
+            self.kept_count += 1
+            return True
+
+        # قاعدة 2: الحوارات القصيرة ذات المشاعر القوية تُحفظ
+        sentiment_score = getattr(turn, 'sentiment_score', 0.0)
+        if sentiment_score >= self.sentiment_threshold:
+            self.kept_by_sentiment += 1
+            self.kept_count += 1
+            logger.debug(f"احتفاظ بحوار قصير بسبب المشاعر القوية: {turn.text[:30]}...")
+            return True
+
+        # تسجيل الحوار المفلتر
+        self.filter_log.append({
+            "scene_id": turn.scene_id,
+            "turn_id": turn.turn_id,
+            "speaker": turn.speaker,
+            "text": turn.text,
+            "word_count": word_count,
+            "reason": "short_dialogue"
+        })
+        self.filtered_count += 1
+        return False
+
+    def filter_scenes(self, scenes: List['Scene']) -> List['Scene']:
+        """
+        تطبيق الفلترة على جميع المشاهد
+        """
+        filtered_scenes = []
+
+        for scene in scenes:
+            filtered_dialogue = [
+                turn for turn in scene.dialogue
+                if self.should_keep_turn(turn)
+            ]
+
+            # إنشاء نسخة جديدة من المشهد مع الحوارات المفلترة
+            new_scene = Scene(
+                scene_id=scene.scene_id,
+                scene_number=scene.scene_number,
+                heading=scene.heading,
+                location=scene.location,
+                time_of_day=scene.time_of_day,
+                int_ext=scene.int_ext,
+                time_period=getattr(scene, 'time_period', 'غير محدد'),
+                actions=scene.actions.copy(),
+                dialogue=filtered_dialogue,
+                transitions=scene.transitions.copy(),
+                element_ids=scene.element_ids.copy(),
+                full_text=scene.full_text,
+                characters=list(set(t.speaker for t in filtered_dialogue if t.speaker)),
+                embedding=scene.embedding,
+                embedding_model=scene.embedding_model
+            )
+            filtered_scenes.append(new_scene)
+
+        logger.info(f"✓ فلترة الجودة: تمت إزالة {self.filtered_count} حوار من أصل {self.filtered_count + self.kept_count}")
+        return filtered_scenes
+
+    def get_stats(self) -> Dict[str, int]:
+        """الحصول على إحصائيات الفلترة"""
+        return {
+            "filtered_count": self.filtered_count,
+            "kept_count": self.kept_count,
+            "kept_by_sentiment": self.kept_by_sentiment,
+            "total_processed": self.filtered_count + self.kept_count
+        }
+
+    def export_filter_log(self, output_path: str):
+        """حفظ سجل الفلترة"""
+        try:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "stats": self.get_stats(),
+                    "filtered_dialogues": self.filter_log
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"✓ تم حفظ سجل الفلترة في: {output_path}")
+        except Exception as e:
+            logger.error(f"✗ فشل حفظ سجل الفلترة: {e}")
+
+
+# ----------------------------
+# فئة إثراء السياق (ContextEnricher)
+# ----------------------------
+class ContextEnricher:
+    """
+    إثراء السياق للحوارات قبل التصدير
+    """
+
+    @staticmethod
+    def get_last_significant_action(actions: List[str], min_length: int = 10) -> str:
+        """
+        استخراج آخر سطر وصفي مهم (أكثر من min_length حرفاً)
+        """
+        for action in reversed(actions):
+            cleaned = action.strip()
+            if len(cleaned) >= min_length and cleaned not in TRANSITIONS:
+                return cleaned
+        return ""
+
+    @staticmethod
+    def build_enriched_scene_setup(scene: 'Scene', last_action: str = "") -> str:
+        """
+        بناء وصف المشهد مع السياق الوصفي
+        التنسيق: "المكان: X. [سياق: Y]. المتحدث: Z"
+        """
+        parts = []
+
+        # المكان
+        if scene.location:
+            parts.append(f"المكان: {scene.location}")
+        elif scene.heading:
+            parts.append(f"المشهد: {scene.heading}")
+
+        # الوقت
+        if scene.time_of_day:
+            parts.append(f"الوقت: {scene.time_of_day}")
+
+        # داخلي/خارجي
+        if scene.int_ext:
+            parts.append(f"النوع: {scene.int_ext}")
+
+        # الفترة الزمنية
+        time_period = getattr(scene, 'time_period', None)
+        if time_period and time_period != "غير محدد":
+            parts.append(f"السنة: {time_period}")
+
+        setup = ". ".join(parts)
+
+        # إضافة السياق الوصفي
+        if last_action:
+            setup += f"\n[سياق: {last_action}]"
+
+        return setup
+
+    @staticmethod
+    def format_contextual_input(scene: 'Scene', turn: 'DialogueTurn',
+                                context_buffer: List[str], last_action: str = "") -> str:
+        """
+        تنسيق الإدخال مع السياق الكامل
+        """
+        scene_setup = ContextEnricher.build_enriched_scene_setup(scene, last_action)
+
+        current_history = "\n".join(context_buffer) if context_buffer else "بداية الحوار."
+
+        full_input = f"{scene_setup}\n\nسياق الحديث السابق:\n{current_history}\n\nالمتحدث: {turn.speaker}"
+
+        return full_input
+
+
+# ----------------------------
+# دالة استخراج الفترة الزمنية
+# ----------------------------
+def extract_time_period(text: str, last_known: str = "غير محدد") -> Tuple[str, str]:
+    """
+    استخراج الفترة الزمنية من نص المشهد
+
+    Args:
+        text: نص عنوان المشهد أو محتواه
+        last_known: آخر سنة معروفة للوراثة
+
+    Returns:
+        tuple: (السنة المستخرجة, آخر سنة معروفة للمشهد التالي)
+    """
+    try:
+        match = YEAR_PATTERN.search(text or "")
+        if match:
+            year = match.group(0)
+            return year, year
+        return last_known, last_known
+    except Exception as e:
+        logger.error(f"فشل استخراج الفترة الزمنية: {e}")
+        return "غير محدد", last_known
+
 
 # ----------------------------
 # 1) Open-source Unstructured (local partition)
@@ -286,6 +714,7 @@ class Scene:
     location: Optional[str]
     time_of_day: Optional[str]
     int_ext: Optional[str]
+    time_period: str = "غير محدد"  # حقل جديد للفترة الزمنية
     actions: list[str] = field(default_factory=list)
     dialogue: list[DialogueTurn] = field(default_factory=list)
     transitions: list[str] = field(default_factory=list)
@@ -304,6 +733,7 @@ def elements_to_scenes(elements: list[dict[str, Any]]) -> list[Scene]:
     current_turn_eids: list[str] = []
     turn_counter = 0
     pending_location = False
+    last_known_year = "غير محدد"  # لوراثة الفترة الزمنية بين المشاهد
 
     def flush_turn():
         nonlocal current_speaker, current_turn_text, current_turn_eids, turn_counter, current
@@ -341,12 +771,22 @@ def elements_to_scenes(elements: list[dict[str, Any]]) -> list[Scene]:
         parts.extend(scene.transitions)
         scene.full_text = "\n".join([p for p in parts if p.strip()]).strip()
 
+        # استخراج الفترة الزمنية من محتوى المشهد إذا لم تكن موجودة
+        if scene.time_period == "غير محدد":
+            period, _ = extract_time_period(scene.full_text, scene.time_period)
+            scene.time_period = period
+
     def start_scene(meta: dict[str, Any]):
-        nonlocal current, turn_counter, pending_location
+        nonlocal current, turn_counter, pending_location, last_known_year
         if current:
             flush_turn()
             finalize_scene(current)
             scenes.append(current)
+
+        # استخراج الفترة الزمنية من عنوان المشهد
+        heading = meta.get("heading") or ""
+        time_period, last_known_year = extract_time_period(heading, last_known_year)
+
         sid = f"S{meta.get('scene_number', len(scenes) + 1):04d}"
         current = Scene(
             scene_id=sid,
@@ -355,6 +795,7 @@ def elements_to_scenes(elements: list[dict[str, Any]]) -> list[Scene]:
             location=None,
             time_of_day=meta.get("time_of_day"),
             int_ext=meta.get("int_ext"),
+            time_period=time_period,  # إضافة الفترة الزمنية
         )
         turn_counter = 0
         pending_location = True
@@ -918,65 +1359,339 @@ def make_next_turn_pairs(scenes: list[Scene], max_context_turns: int = 6) -> lis
     return pairs
 
 # ----------------------------
-# 5) Main
+# دالة التحقق من صحة ملف الإدخال
+# ----------------------------
+def validate_input_file(file_path: str) -> bool:
+    """التحقق من صحة ملف الإدخال"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"الملف غير موجود: {file_path}")
+
+    if os.path.getsize(file_path) > 100 * 1024 * 1024:  # 100MB
+        raise ValueError("حجم الملف كبير جداً (أكثر من 100 ميغابايت)")
+
+    allowed_extensions = ['.txt', '.pdf', '.md', '.json', '.docx']
+    if not any(file_path.lower().endswith(ext) for ext in allowed_extensions):
+        logger.warning(f"⚠ نوع الملف غير معتاد: {file_path}")
+
+    return True
+
+
+# ----------------------------
+# دالة كتابة ملف آمنة
+# ----------------------------
+def safe_write_file(path: str, content: str, encoding: str = 'utf-8') -> bool:
+    """كتابة ملف مع التحقق من نجاح العملية"""
+    try:
+        with open(path, 'w', encoding=encoding) as f:
+            f.write(content)
+        # التحقق من أن الملف كُتب بنجاح
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return True
+        else:
+            logger.error(f"✗ فشل في كتابة الملف: {path}")
+            return False
+    except Exception as e:
+        logger.error(f"✗ خطأ في كتابة الملف {path}: {e}")
+        return False
+
+
+# ----------------------------
+# دالة تصدير Alpaca المحسّنة مع إثراء السياق
+# ----------------------------
+def export_enriched_alpaca(scenes: list[Scene], output_path: str, max_context_turns: int = 6) -> list[dict[str, Any]]:
+    """
+    تصدير بصيغة Alpaca مع السياق المحسّن
+
+    Args:
+        scenes: قائمة المشاهد
+        output_path: مسار ملف الإخراج
+        max_context_turns: عدد الحوارات السابقة للسياق
+
+    Returns:
+        قائمة البيانات المصدّرة
+    """
+    data: list[dict[str, Any]] = []
+
+    for scene in scenes:
+        if not scene.dialogue:
+            continue
+
+        # استخراج آخر سطر وصفي مهم
+        last_action = ContextEnricher.get_last_significant_action(scene.actions)
+
+        # بناء وصف المشهد المحسّن
+        scene_setup = ContextEnricher.build_enriched_scene_setup(scene, last_action)
+
+        context_buffer: list[str] = []
+
+        for i, turn in enumerate(scene.dialogue):
+            if not turn.text.strip() or not turn.speaker.strip():
+                continue
+
+            # تنسيق الإدخال مع السياق الكامل
+            full_input = ContextEnricher.format_contextual_input(
+                scene, turn, context_buffer, last_action
+            )
+
+            data.append({
+                "instruction": "أكمل الحوار التالي بناءً على السياق المعطى.",
+                "input": full_input,
+                "output": turn.text,
+                "scene_id": scene.scene_id,
+                "turn_id": turn.turn_id,
+                "speaker": turn.speaker,
+                "time_period": scene.time_period
+            })
+
+            # تحديث سجل الحوار
+            context_buffer.append(f"{turn.speaker}: {turn.text}")
+            if len(context_buffer) > max_context_turns:
+                context_buffer = context_buffer[-max_context_turns:]
+
+    # كتابة الملف
+    write_jsonl(output_path, data)
+    logger.info(f"✓ تم تصدير {len(data)} سجل Alpaca إلى: {output_path}")
+
+    return data
+
+
+# ----------------------------
+# 5) Main - الدالة الرئيسية المحدّثة
 # ----------------------------
 def main():
+    """
+    الدالة الرئيسية لنظام الراوي الإصدار 4.0
+    تدمج جميع التحسينات: توحيد الكيانات، فلترة الجودة، إثراء السياق، الميتاداتا الزمنية
+    """
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to screenplay file (txt/docx/pdf/...) OR elements.json list")
-    ap.add_argument("--out_dir", required=True, help="Output directory for dataset files")
-    ap.add_argument("--extractor", default="auto", choices=["auto", "unstructured", "docling"], help="Extraction backend (auto: pdf->docling else unstructured)")
-    ap.add_argument("--save_docling_artifacts", action="store_true", help="If set and extractor=docling, save docling raw/markdown/doctags into out_dir")
-    ap.add_argument("--docling_ocr_langs", default="ar,en", help="Comma-separated OCR languages for docling (default: ar,en)")
-    ap.add_argument("--docling_threads", type=int, default=4, help="Docling threads (default: 4)")
-    ap.add_argument("--use_api_embeddings", action="store_true", help="If set, run Unstructured API on-demand jobs to add embeddings")
-    ap.add_argument("--api_work_dir", default="./_unstructured_work", help="Temp work dir for API jobs (input/output)")
+    import time
+
+    start_time = time.time()
+
+    ap = argparse.ArgumentParser(
+        description="نظام الراوي v4.0 - معالجة السيناريوهات العربية"
+    )
+    ap.add_argument("--input", required=True, help="مسار ملف السيناريو (txt/docx/pdf/...) أو ملف elements.json")
+    ap.add_argument("--out_dir", required=True, help="مجلد الإخراج للملفات")
+    ap.add_argument("--extractor", default="auto", choices=["auto", "unstructured", "docling"],
+                    help="محرك الاستخراج (auto: pdf->docling وإلا unstructured)")
+    ap.add_argument("--save_docling_artifacts", action="store_true",
+                    help="حفظ مخرجات docling الوسيطة")
+    ap.add_argument("--docling_ocr_langs", default="ar,en",
+                    help="لغات OCR لـ docling (افتراضي: ar,en)")
+    ap.add_argument("--docling_threads", type=int, default=4,
+                    help="عدد خيوط docling (افتراضي: 4)")
+    ap.add_argument("--use_api_embeddings", action="store_true",
+                    help="استخدام API للتضمينات")
+    ap.add_argument("--api_work_dir", default="./_unstructured_work",
+                    help="مجلد العمل المؤقت لـ API")
     ap.add_argument("--embedder_subtype", default="bedrock")
     ap.add_argument("--embedder_model", default="cohere.embed-multilingual-v3")
-    ap.add_argument("--write_sqlite", action="store_true", help="If set, write a SQLite database into out_dir")
+    ap.add_argument("--write_sqlite", action="store_true",
+                    help="كتابة قاعدة بيانات SQLite")
+
+    # خيارات التحسينات الجديدة (v4.0)
+    ap.add_argument("--enable_entity_canonicalization", action="store_true", default=True,
+                    help="تفعيل توحيد الكيانات (افتراضي: مفعّل)")
+    ap.add_argument("--similarity_threshold", type=float, default=0.85,
+                    help="عتبة التشابه لتوحيد الأسماء (افتراضي: 0.85)")
+    ap.add_argument("--enable_quality_filter", action="store_true", default=True,
+                    help="تفعيل فلترة الجودة (افتراضي: مفعّل)")
+    ap.add_argument("--min_words", type=int, default=3,
+                    help="الحد الأدنى لعدد الكلمات (افتراضي: 3)")
+    ap.add_argument("--sentiment_threshold", type=float, default=0.8,
+                    help="عتبة المشاعر للاحتفاظ بالحوارات القصيرة (افتراضي: 0.8)")
+    ap.add_argument("--export_alpaca", action="store_true", default=True,
+                    help="تصدير بصيغة Alpaca المحسّنة (افتراضي: مفعّل)")
+
     args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    # إحصائيات العملية الشاملة
+    process_stats = {
+        "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "input_file": args.input,
+        "output_dir": args.out_dir,
+        "stages": {}
+    }
 
-    docling_langs = [x.strip() for x in (args.docling_ocr_langs or "").split(",") if x.strip()]
-    elements, pipeline_meta = elements_from_input(
-        input_path=args.input,
-        extractor=args.extractor,
-        out_dir=args.out_dir,
-        save_docling_artifacts=bool(args.save_docling_artifacts),
-        docling_ocr_languages=docling_langs or None,
-        docling_threads=int(args.docling_threads),
-    )
+    try:
+        # ----------------------------
+        # المرحلة 1: التحقق من المدخلات
+        # ----------------------------
+        logger.info("=" * 60)
+        logger.info("🚀 بدء معالجة السيناريو - نظام الراوي v4.0")
+        logger.info("=" * 60)
 
-    # Structure screenplay
-    scenes = elements_to_scenes(elements)
+        validate_input_file(args.input)
+        os.makedirs(args.out_dir, exist_ok=True)
+        logger.info(f"✓ ملف الإدخال: {args.input}")
+        logger.info(f"✓ مجلد الإخراج: {args.out_dir}")
 
-    # Optional: API embeddings
-    if args.use_api_embeddings:
-        api_key = os.getenv("UNSTRUCTURED_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("UNSTRUCTURED_API_KEY is not set.")
-        embed_scenes_via_on_demand_jobs(
-            scenes=scenes,
-            api_key=api_key,
-            work_dir=args.api_work_dir,
-            batch_size=10,
-            embedder_subtype=args.embedder_subtype,
-            embedder_model=args.embedder_model,
+        # ----------------------------
+        # المرحلة 2: استخراج العناصر
+        # ----------------------------
+        logger.info("\n📄 المرحلة 1: استخراج العناصر من الملف...")
+        stage_start = time.time()
+
+        docling_langs = [x.strip() for x in (args.docling_ocr_langs or "").split(",") if x.strip()]
+        elements, pipeline_meta = elements_from_input(
+            input_path=args.input,
+            extractor=args.extractor,
+            out_dir=args.out_dir,
+            save_docling_artifacts=bool(args.save_docling_artifacts),
+            docling_ocr_languages=docling_langs or None,
+            docling_threads=int(args.docling_threads),
         )
 
-    # Write datasets
-    scenes_rows: list[dict[str, Any]] = []
-    dialogue_rows: list[dict[str, Any]] = []
-    for sc in scenes:
-        scenes_rows.append(
-            {
+        process_stats["stages"]["extraction"] = {
+            "elements_count": len(elements),
+            "extractor": pipeline_meta.get("extractor", "unknown"),
+            "duration_seconds": round(time.time() - stage_start, 2)
+        }
+        logger.info(f"✓ تم استخراج {len(elements)} عنصر")
+
+        # ----------------------------
+        # المرحلة 3: بناء المشاهد مع الميتاداتا الزمنية
+        # ----------------------------
+        logger.info("\n🎬 المرحلة 2: بناء هيكل المشاهد...")
+        stage_start = time.time()
+
+        scenes = elements_to_scenes(elements)
+
+        # إحصائيات الفترات الزمنية
+        time_periods_found = sum(1 for s in scenes if s.time_period != "غير محدد")
+        process_stats["stages"]["scene_parsing"] = {
+            "scenes_count": len(scenes),
+            "time_periods_found": time_periods_found,
+            "duration_seconds": round(time.time() - stage_start, 2)
+        }
+        logger.info(f"✓ تم بناء {len(scenes)} مشهد")
+        logger.info(f"✓ تم استخراج الفترة الزمنية لـ {time_periods_found} مشهد")
+
+        # ----------------------------
+        # المرحلة 4: توحيد الكيانات (Entity Canonicalization)
+        # ----------------------------
+        canonicalizer_stats = {}
+        if args.enable_entity_canonicalization:
+            logger.info("\n👥 المرحلة 3: توحيد أسماء الشخصيات...")
+            stage_start = time.time()
+
+            try:
+                canonicalizer = EntityCanonicalizer(similarity_threshold=args.similarity_threshold)
+                canonicalizer.build_canonical_map(scenes)
+                scenes = canonicalizer.apply_normalization(scenes)
+
+                # حفظ سجل الدمج
+                merge_log_path = os.path.join(args.out_dir, "entity_merge_log.json")
+                canonicalizer.export_merge_log(merge_log_path)
+
+                canonicalizer_stats = canonicalizer.get_stats()
+                process_stats["stages"]["entity_canonicalization"] = {
+                    **canonicalizer_stats,
+                    "duration_seconds": round(time.time() - stage_start, 2)
+                }
+
+                if canonicalizer_stats["merges_performed"] > 0:
+                    logger.info(f"✓ تم دمج {canonicalizer_stats['merges_performed']} اسم")
+                else:
+                    logger.info("✓ لا توجد أسماء متشابهة للدمج")
+
+            except Exception as e:
+                logger.error(f"✗ فشل توحيد الكيانات: {e}")
+                process_stats["stages"]["entity_canonicalization"] = {"error": str(e)}
+        else:
+            logger.info("\n⏭️ تم تخطي توحيد الكيانات (معطّل)")
+
+        # ----------------------------
+        # المرحلة 5: فلترة الجودة
+        # ----------------------------
+        filter_stats = {}
+        original_dialogue_count = sum(len(s.dialogue) for s in scenes)
+
+        if args.enable_quality_filter:
+            logger.info("\n🔍 المرحلة 4: فلترة الحوارات منخفضة الجودة...")
+            stage_start = time.time()
+
+            try:
+                quality_filter = QualityFilter(
+                    min_words=args.min_words,
+                    high_sentiment_threshold=args.sentiment_threshold
+                )
+                scenes = quality_filter.filter_scenes(scenes)
+
+                # حفظ سجل الفلترة
+                filter_log_path = os.path.join(args.out_dir, "quality_filter_log.json")
+                quality_filter.export_filter_log(filter_log_path)
+
+                filter_stats = quality_filter.get_stats()
+                process_stats["stages"]["quality_filter"] = {
+                    **filter_stats,
+                    "duration_seconds": round(time.time() - stage_start, 2)
+                }
+
+                if filter_stats["filtered_count"] > 0:
+                    logger.info(f"✓ تمت إزالة {filter_stats['filtered_count']} حوار")
+                    logger.info(f"✓ تم الاحتفاظ بـ {filter_stats['kept_count']} حوار")
+                else:
+                    logger.info("✓ جميع الحوارات تجتاز معايير الجودة")
+
+            except Exception as e:
+                logger.error(f"✗ فشل فلترة الجودة: {e}")
+                process_stats["stages"]["quality_filter"] = {"error": str(e)}
+        else:
+            logger.info("\n⏭️ تم تخطي فلترة الجودة (معطّلة)")
+
+        # ----------------------------
+        # المرحلة 6: التضمينات (اختياري)
+        # ----------------------------
+        if args.use_api_embeddings:
+            logger.info("\n🧠 المرحلة 5: إضافة التضمينات...")
+            stage_start = time.time()
+
+            try:
+                api_key = os.getenv("UNSTRUCTURED_API_KEY", "").strip()
+                if not api_key:
+                    raise RuntimeError("UNSTRUCTURED_API_KEY غير معيّن")
+
+                embed_scenes_via_on_demand_jobs(
+                    scenes=scenes,
+                    api_key=api_key,
+                    work_dir=args.api_work_dir,
+                    batch_size=10,
+                    embedder_subtype=args.embedder_subtype,
+                    embedder_model=args.embedder_model,
+                )
+
+                embedded_count = sum(1 for s in scenes if s.embedding is not None)
+                process_stats["stages"]["embeddings"] = {
+                    "embedded_scenes": embedded_count,
+                    "duration_seconds": round(time.time() - stage_start, 2)
+                }
+                logger.info(f"✓ تم تضمين {embedded_count} مشهد")
+
+            except Exception as e:
+                logger.error(f"✗ فشل إضافة التضمينات: {e}")
+                process_stats["stages"]["embeddings"] = {"error": str(e)}
+
+        # ----------------------------
+        # المرحلة 7: بناء مجموعات البيانات
+        # ----------------------------
+        logger.info("\n📊 المرحلة 6: بناء مجموعات البيانات...")
+        stage_start = time.time()
+
+        # بناء صفوف البيانات مع الميتاداتا الزمنية
+        scenes_rows: list[dict[str, Any]] = []
+        dialogue_rows: list[dict[str, Any]] = []
+
+        for sc in scenes:
+            scenes_rows.append({
                 "scene_id": sc.scene_id,
                 "scene_number": sc.scene_number,
                 "heading": sc.heading,
                 "location": sc.location,
                 "time_of_day": sc.time_of_day,
                 "int_ext": sc.int_ext,
+                "time_period": sc.time_period,  # حقل جديد
                 "characters": sc.characters,
                 "actions": sc.actions,
                 "transitions": sc.transitions,
@@ -987,55 +1702,153 @@ def main():
                 "word_count": len((sc.full_text or "").split()),
                 "dialogue_turns_count": len(sc.dialogue),
                 "actions_count": len(sc.actions),
-            }
-        )
-        for dt in sc.dialogue:
-            dialogue_rows.append(
-                {
+            })
+
+            for dt in sc.dialogue:
+                dialogue_rows.append({
                     "scene_id": dt.scene_id,
                     "turn_id": dt.turn_id,
                     "speaker": dt.speaker,
                     "text": dt.text,
                     "element_ids": dt.element_ids,
                     "word_count": len((dt.text or "").split()),
-                }
+                })
+
+        characters_rows = build_characters_index(scenes)
+        pairs_rows = make_next_turn_pairs(scenes)
+        interactions_rows = build_interactions_index(scenes)
+        speaker_id_rows = make_speaker_id_pairs(scenes)
+
+        process_stats["stages"]["dataset_building"] = {
+            "duration_seconds": round(time.time() - stage_start, 2)
+        }
+
+        # ----------------------------
+        # المرحلة 8: كتابة الملفات
+        # ----------------------------
+        logger.info("\n💾 المرحلة 7: كتابة الملفات...")
+        stage_start = time.time()
+
+        files_written = []
+
+        # كتابة ملفات JSONL الأساسية
+        write_jsonl(os.path.join(args.out_dir, "scenes.jsonl"), scenes_rows)
+        files_written.append("scenes.jsonl")
+
+        write_jsonl(os.path.join(args.out_dir, "dialogue_turns.jsonl"), dialogue_rows)
+        files_written.append("dialogue_turns.jsonl")
+
+        write_jsonl(os.path.join(args.out_dir, "characters.jsonl"), characters_rows)
+        files_written.append("characters.jsonl")
+
+        write_jsonl(os.path.join(args.out_dir, "next_turn_pairs.jsonl"), pairs_rows)
+        files_written.append("next_turn_pairs.jsonl")
+
+        write_jsonl(os.path.join(args.out_dir, "character_interactions.jsonl"), interactions_rows)
+        files_written.append("character_interactions.jsonl")
+
+        write_jsonl(os.path.join(args.out_dir, "speaker_id_pairs.jsonl"), speaker_id_rows)
+        files_written.append("speaker_id_pairs.jsonl")
+
+        # تصدير Alpaca المحسّن مع إثراء السياق
+        if args.export_alpaca:
+            alpaca_path = os.path.join(args.out_dir, "alpaca_enriched.jsonl")
+            alpaca_data = export_enriched_alpaca(scenes, alpaca_path)
+            files_written.append("alpaca_enriched.jsonl")
+            process_stats["alpaca_records"] = len(alpaca_data)
+
+        # حفظ العناصر الخام
+        with open(os.path.join(args.out_dir, "elements.local.json"), "w", encoding="utf-8") as f:
+            json.dump(elements, f, ensure_ascii=False, indent=2)
+        files_written.append("elements.local.json")
+
+        # قاعدة بيانات SQLite
+        if args.write_sqlite:
+            db_path = os.path.join(args.out_dir, "screenplay_dataset.sqlite")
+            write_sqlite_db(
+                db_path=db_path,
+                scenes_rows=scenes_rows,
+                dialogue_rows=dialogue_rows,
+                characters_rows=characters_rows,
+                interactions_rows=interactions_rows,
+                meta=pipeline_meta,
             )
+            files_written.append("screenplay_dataset.sqlite")
 
-    characters_rows = build_characters_index(scenes)
-    pairs_rows = make_next_turn_pairs(scenes)
-    interactions_rows = build_interactions_index(scenes)
-    speaker_id_rows = make_speaker_id_pairs(scenes)
+        process_stats["stages"]["file_writing"] = {
+            "files_written": files_written,
+            "duration_seconds": round(time.time() - stage_start, 2)
+        }
 
-    write_jsonl(os.path.join(args.out_dir, "scenes.jsonl"), scenes_rows)
-    write_jsonl(os.path.join(args.out_dir, "dialogue_turns.jsonl"), dialogue_rows)
-    write_jsonl(os.path.join(args.out_dir, "characters.jsonl"), characters_rows)
-    write_jsonl(os.path.join(args.out_dir, "next_turn_pairs.jsonl"), pairs_rows)
-    write_jsonl(os.path.join(args.out_dir, "character_interactions.jsonl"), interactions_rows)
-    write_jsonl(os.path.join(args.out_dir, "speaker_id_pairs.jsonl"), speaker_id_rows)
+        # ----------------------------
+        # المرحلة 9: حفظ الإحصائيات والتقرير النهائي
+        # ----------------------------
+        total_time = time.time() - start_time
+        process_stats["total_duration_seconds"] = round(total_time, 2)
+        process_stats["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    # Also export the local elements (for traceability)
-    with open(os.path.join(args.out_dir, "elements.local.json"), "w", encoding="utf-8") as f:
-        json.dump(elements, f, ensure_ascii=False, indent=2)
+        # الإحصائيات النهائية
+        process_stats["final_stats"] = {
+            "scenes": len(scenes_rows),
+            "dialogue_turns": len(dialogue_rows),
+            "characters": len(characters_rows),
+            "next_turn_pairs": len(pairs_rows),
+            "interactions": len(interactions_rows),
+            "speaker_id_pairs": len(speaker_id_rows),
+            "time_periods_extracted": time_periods_found,
+            "entities_merged": canonicalizer_stats.get("merges_performed", 0),
+            "dialogues_filtered": filter_stats.get("filtered_count", 0)
+        }
 
-    if args.write_sqlite:
-        db_path = os.path.join(args.out_dir, "screenplay_dataset.sqlite")
-        write_sqlite_db(
-            db_path=db_path,
-            scenes_rows=scenes_rows,
-            dialogue_rows=dialogue_rows,
-            characters_rows=characters_rows,
-            interactions_rows=interactions_rows,
-            meta=pipeline_meta,
-        )
+        # حفظ ملف الإحصائيات
+        stats_path = os.path.join(args.out_dir, "processing_stats.json")
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(process_stats, f, ensure_ascii=False, indent=2)
 
-    print("DONE")
-    print(f"- scenes: {len(scenes_rows)}")
-    print(f"- dialogue turns: {len(dialogue_rows)}")
-    print(f"- characters: {len(characters_rows)}")
-    print(f"- next-turn pairs: {len(pairs_rows)}")
-    print(f"- interactions: {len(interactions_rows)}")
-    print(f"- speaker-id pairs: {len(speaker_id_rows)}")
-    print(f"Output dir: {args.out_dir}")
+        # ----------------------------
+        # الطباعة النهائية
+        # ----------------------------
+        logger.info("\n" + "=" * 60)
+        logger.info("✅ اكتملت المعالجة بنجاح!")
+        logger.info("=" * 60)
+        print("\n📈 الإحصائيات النهائية:")
+        print(f"   • المشاهد: {len(scenes_rows)}")
+        print(f"   • الحوارات: {len(dialogue_rows)}")
+        print(f"   • الشخصيات: {len(characters_rows)}")
+        print(f"   • أزواج الحوار التالي: {len(pairs_rows)}")
+        print(f"   • التفاعلات: {len(interactions_rows)}")
+        print(f"   • أزواج تحديد المتحدث: {len(speaker_id_rows)}")
+
+        print("\n🆕 تحسينات v4.0:")
+        print(f"   • الفترات الزمنية المستخرجة: {time_periods_found}")
+        print(f"   • الأسماء المدمجة: {canonicalizer_stats.get('merges_performed', 0)}")
+        print(f"   • الحوارات المفلترة: {filter_stats.get('filtered_count', 0)}")
+
+        print(f"\n⏱️ الوقت الإجمالي: {total_time:.2f} ثانية")
+        print(f"📁 مجلد الإخراج: {args.out_dir}")
+        print(f"📄 عدد الملفات: {len(files_written)}")
+
+    except FileNotFoundError as e:
+        logger.error(f"✗ خطأ: {e}")
+        raise
+    except ValueError as e:
+        logger.error(f"✗ خطأ في القيمة: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"✗ خطأ غير متوقع: {e}")
+        # حفظ حالة الخطأ
+        error_stats = {
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "stages_completed": list(process_stats.get("stages", {}).keys())
+        }
+        error_path = os.path.join(args.out_dir, "error_log.json")
+        try:
+            with open(error_path, "w", encoding="utf-8") as f:
+                json.dump(error_stats, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+        raise
 
 if __name__ == "__main__":
     main()
