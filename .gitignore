@@ -73,6 +73,7 @@ next-env.d.ts
 *.bak
 *.tmp
 *.temp
+.hypothesis/
 
 # Test artifacts
 .hypothesis/
