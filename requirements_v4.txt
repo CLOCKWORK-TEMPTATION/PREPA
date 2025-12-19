@@ -1,0 +1,17 @@
+# متطلبات نظام الراوي الإصدار 4.0
+# Al-Rawi v4.0 Requirements
+# ==============================
+
+# المكتبات الجديدة للإصدار 4.0
+# New libraries for v4.0
+rapidfuzz>=3.0.0           # حساب التشابه السريع
+hypothesis>=6.0.0          # اختبارات الخصائص
+
+# المكتبات الموجودة (من الإصدارات السابقة)
+# Existing libraries (from previous versions)
+# transformers>=4.20.0
+# sentence-transformers>=2.2.0
+# docling>=1.0.0
+# google-genai>=0.3.0
+# pandas>=1.5.0
+# networkx>=2.8.0
