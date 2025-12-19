@@ -10,19 +10,13 @@ __pycache__/
 /venv/
 .venv/
 env/
-.env/
 
 # Distribution / packaging
 *.egg
 *.egg-info/
 dist/
-build/
 eggs/
 *.whl
-
-# Logs
-*.log
-*.log.*
 
 # ===== Node.js =====
 # dependencies
@@ -69,17 +63,14 @@ next-env.d.ts
 .hypothesis/
 .pytest_cache/
 
+# ===== Logs =====
+*.log
+*.log.*
+
+# ===== Demo & Output =====
+demo_output/
+
 # ===== Misc =====
 *.bak
 *.tmp
 *.temp
-.hypothesis/
-
-# Test artifacts
-.hypothesis/
-
-# Demo output
-demo_output/
-
-# Log files
-*.log
