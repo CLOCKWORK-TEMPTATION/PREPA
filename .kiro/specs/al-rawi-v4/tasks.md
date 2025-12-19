@@ -114,6 +114,17 @@
   - _المتطلبات: 3.5, 6.2_
   - **تم التنفيذ في: al_rawi_v4.py (فئة DatasetExporter)**
 
+- [x] 4.6 دمج ContextEnricher و QualityFilter في الملف الرئيسي screenplay_to_dataset1.py ✅
+  - استيراد وحدتي ContextEnricher و QualityFilter من al_rawi_v4
+  - تحديث DatasetExporter ليدعم إثراء السياق وفلترة الجودة
+  - إضافة دوال مساعدة: _filter_scenes_quality, _get_last_significant_action, _build_enriched_scene_setup
+  - تحديث export_contextual_alpaca لدعم إثراء السياق مع metadata محسّنة
+  - تطبيق فلترة الجودة في جميع طرق التصدير (ShareGPT, RAG, CSV)
+  - إضافة دالة get_enhancement_stats للحصول على إحصائيات التحسينات
+  - تحديث main() لعرض حالة وإحصائيات التحسينات
+  - _المتطلبات: 2.1-2.5, 3.1-3.5_
+  - **تم التنفيذ في: screenplay_to_dataset1.py**
+
 - [ ] 5. تطوير وحدة الميتاداتا الزمنية
   - تعديل نموذج Scene لإضافة حقل time_period
   - تعديل ScreenplayParser لاستخراج السنوات من العناوين
