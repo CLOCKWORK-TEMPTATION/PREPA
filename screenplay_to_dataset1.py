@@ -120,6 +120,7 @@ class Scene:
     location: str
     time_of_day: str
     int_ext: str
+    time_period: Optional[str] = None
     actions: List[str] = field(default_factory=list)
     dialogue: List[DialogueTurn] = field(default_factory=list)
     characters: List[str] = field(default_factory=list)
@@ -274,13 +275,18 @@ class ScreenplayParser:
                 time_val = next((t for t in ["ليل", "نهار", "مساء", "صباح"] if t in line), "غير محدد")
                 loc_val = re.sub(r'(مشهد|م\.|Scene|\d+|ليل|نهار|خارجي|داخلي|[\-\.])', '', line).strip()
                 
+                # استخراج السنة من العنوان
+                year_match = re.search(r'\b(19|20|21)\d{2}\b', line)
+                time_period_val = year_match.group(0) if year_match else None
+                
                 current_scene = Scene(
                     scene_id=f"S{num:04d}",
                     scene_number=num,
                     heading=line,
                     location=loc_val or "موقع غير محدد",
                     time_of_day=time_val,
-                    int_ext="داخلي" if "داخلي" in line else "خارجي"
+                    int_ext="داخلي" if "داخلي" in line else "خارجي",
+                    time_period=time_period_val
                 )
                 turn_counter = 0
                 continue
@@ -319,7 +325,19 @@ class ScreenplayParser:
             finalize_scene(current_scene)
             scenes.append(current_scene)
 
+        # آلية وراثة الفترة الزمنية بين المشاهد المتتالية
+        self._inherit_time_periods(scenes)
+
         return scenes
+
+    def _inherit_time_periods(self, scenes: List[Scene]):
+        """وراثة الفترة الزمنية من المشاهد السابقة للمشاهد التي لا تحتوي على فترة محددة"""
+        current_time_period = None
+        for scene in scenes:
+            if scene.time_period:
+                current_time_period = scene.time_period
+            elif current_time_period:
+                scene.time_period = current_time_period
 
 # ---------------------------------------------------------
 # 6. طبقة الإثراء الذكي (Enrichment Layer)
