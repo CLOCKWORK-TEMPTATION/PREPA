@@ -10,19 +10,13 @@ __pycache__/
 /venv/
 .venv/
 env/
-.env/
 
 # Distribution / packaging
 *.egg
 *.egg-info/
 dist/
-build/
 eggs/
 *.whl
-
-# Logs
-*.log
-*.log.*
 
 # ===== Node.js =====
 # dependencies
@@ -64,6 +58,17 @@ desktop.ini
 # ===== TypeScript =====
 *.tsbuildinfo
 next-env.d.ts
+
+# ===== Testing =====
+.hypothesis/
+.pytest_cache/
+
+# ===== Logs =====
+*.log
+*.log.*
+
+# ===== Demo & Output =====
+demo_output/
 
 # ===== Misc =====
 *.bak

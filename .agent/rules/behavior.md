@@ -3,6 +3,11 @@ trigger: glob
 globs: **/*.ts,**/*.py
 ---
 
+---
+
+trigger: glob
+---
+
 # Behavior Rules
 
 First: Language and tone
